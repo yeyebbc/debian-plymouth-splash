@@ -15,9 +15,15 @@ menu. Leave Plymouth, Secure Boot, and the existing boot entries alone.
 MODES is a comma-separated GRUB resolution list, such as 1920x1080,auto.
 The script neither installs GRUB nor enables os-prober. It keeps a backup of
 any grub.cfg it replaces and does not reboot.
+For this installation, GRUB_DISABLE_UEFI_FIRMWARE=true hides the stock
+firmware entry, false permits it, and unset preserves its visibility.
+A disabled generator stays disabled. Custom entries are left alone.
 EOF
 }
 fail() { printf '%s\n' "$*" >&2; exit 1; }
+script_path=$(realpath -- "$0")
+script_dir=${script_path%/*}
+. "$script_dir/grub-firmware.sh"
 mode=3840x2160,2560x1440,1920x1080,auto
 case $#:${1-} in
     1:-h|1:--help) usage; exit 0 ;;
@@ -48,6 +54,7 @@ marker='# Managed by debian-grub-menu.sh'
 [ -d /etc/default/grub.d ] && [ -d "$scripts" ] || fail 'Expected the Debian GRUB defaults and generator directories.'
 exec 9>/boot/grub/.centered-menu.lock
 flock -n 9 || fail 'Another GRUB theme installation is running.'
+firmware_policy=$(grub_firmware_policy /etc/default/grub "$grub" "$scripts/30_uefi-firmware")
 work=$(mktemp -d /boot/grub/.centered-menu.XXXXXXXX)
 changes=no
 committed=no
@@ -350,6 +357,7 @@ install -m 0755 -- "$work/prober" "$prober"
 rm -f -- "$legacy"
 
 grub-mkconfig -o "$work/grub.cfg"
+grub_apply_firmware_policy "$firmware_policy" "$work/grub.cfg" "$work/no-firmware.cfg"
 grub-script-check "$work/grub.cfg"
 # Accept rediscovered devices and added entries, but never lose a boot option
 # or change a boot payload. Use stable IDs where available, not disk names.
@@ -362,7 +370,13 @@ boot_contract() {
         }
     ' "$1" | LC_ALL=C sort
 }
-boot_contract "$grub" > "$work/before"
+if [ "$firmware_policy" = hide ]; then
+    grub_without_firmware_entry "$grub" > "$work/active-no-firmware.cfg" ||
+        fail 'The installed firmware section contains custom content; leaving GRUB alone.'
+    boot_contract "$work/active-no-firmware.cfg" > "$work/before"
+else
+    boot_contract "$grub" > "$work/before"
+fi
 boot_contract "$work/grub.cfg" > "$work/after"
 LC_ALL=C comm -23 "$work/before" "$work/after" > "$work/missing"
 if [ -s "$work/missing" ]; then

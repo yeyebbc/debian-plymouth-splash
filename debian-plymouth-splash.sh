@@ -12,6 +12,9 @@ Installs a white Debian swirl on black for boot, power-off, and reboot.
 Requires Debian with GRUB, systemd, initramfs-tools, Plymouth's script
 and label plugins, desktop-base, and ImageMagick. Re-running is safe.
 GRUB remains visible; existing Windows entries must survive regeneration.
+For this installation, GRUB_DISABLE_UEFI_FIRMWARE=true hides the stock
+firmware entry, false permits it, and unset preserves its visibility.
+A disabled generator stays disabled. Custom entries are left alone.
 EOF
 }
 
@@ -22,6 +25,9 @@ case ${1-} in
     *) usage >&2; exit 2 ;;
 esac
 [ "$(id -u)" -eq 0 ] || fail 'Run this installer with sudo.'
+script_path=$(realpath -- "$0")
+script_dir=${script_path%/*}
+. "$script_dir/grub-firmware.sh"
 for tool in plymouth-set-default-theme grub-mkconfig grub-script-check update-initramfs unmkinitramfs systemctl systemd-analyze; do
     command -v "$tool" >/dev/null || fail "Missing required command: $tool"
 done
@@ -36,8 +42,10 @@ logo=/usr/share/desktop-base/debian-logos/logo.svg
 grub=/boot/grub/grub.cfg
 dropin=/etc/default/grub.d/99-debian-monochrome-splash.cfg
 [ -r "$logo" ] || fail 'Install desktop-base for the official Debian swirl.'
-[ -f "$grub" ] || fail "No installed GRUB configuration at $grub."
-[ ! -L "$theme" ] && [ ! -L "$dropin" ] || fail 'Refusing to replace a symbolic link.'
+[ -f "$grub" ] && [ ! -L "$grub" ] || fail "Expected a regular GRUB configuration: $grub"
+[ ! -L "$theme" ] && [ ! -L "$dropin" ] && { [ ! -e "$dropin" ] || [ -f "$dropin" ]; } ||
+    fail 'Unexpected Plymouth theme or GRUB defaults path.'
+firmware_policy=$(grub_firmware_policy /etc/default/grub "$grub" /etc/grub.d/30_uefi-firmware)
 set -- /boot/initrd.img-*
 [ -f "$1" ] || fail 'No installed initramfs images under /boot.'
 plugin_dir=$(plymouth --get-splash-plugin-path)
@@ -48,13 +56,7 @@ work=$(mktemp -d)
 grub_work=
 restore_grub=no
 cleanup() {
-    if [ "$restore_grub" = yes ]; then
-        if [ -f "$work/previous-grub-defaults" ]; then
-            cp -p -- "$work/previous-grub-defaults" "$dropin"
-        else
-            rm -f -- "$dropin"
-        fi
-    fi
+    if [ "$restore_grub" = yes ]; then rm -f -- "$dropin"; fi
     [ -z "$grub_work" ] || rm -rf -- "$grub_work"
     rm -rf -- "$work"
 }
@@ -246,23 +248,33 @@ windows_entries() {
     }' "$1"
 }
 
-if ! cmp -s -- "$work/grub-defaults" "$dropin"; then
-    if [ -e "$dropin" ]; then cp -p -- "$dropin" "$work/previous-grub-defaults"; fi
+if [ ! -e "$dropin" ]; then
     restore_grub=yes
     install -D -m 0644 -- "$work/grub-defaults" "$dropin"
 fi
-if ! check_grub "$grub"; then
+if ! check_grub "$grub" ||
+    { [ "$firmware_policy" = enable ] && ! grub_has_firmware_entry "$grub"; }; then
     grub_work=$(mktemp -d /boot/grub/.debian-monochrome.XXXXXXXX)
     grub-mkconfig -o "$grub_work/grub.cfg"
+    grub_apply_firmware_policy "$firmware_policy" "$grub_work/grub.cfg" "$grub_work/no-firmware.cfg"
+    grub-script-check "$grub_work/grub.cfg"
     check_grub "$grub_work/grub.cfg" || fail 'The generated GRUB configuration does not keep a visible menu and quiet splash.'
+    if [ "$firmware_policy" = allow ] && ! grub_has_firmware_entry "$grub_work/grub.cfg"; then
+        fail 'The generated menu lost the firmware entry; leaving the current GRUB menu intact.'
+    fi
     windows_entries "$grub" > "$work/windows.old"
     windows_entries "$grub_work/grub.cfg" > "$work/windows.new"
     if grep -Fxvf "$work/windows.new" "$work/windows.old"; then
         fail 'An existing Windows entry is missing; leaving the current GRUB menu intact.'
     fi
+elif [ "$firmware_policy" = hide ] && grub_has_firmware_entry "$grub"; then
+    grub_work=$(mktemp -d /boot/grub/.debian-monochrome.XXXXXXXX)
+    cp -p -- "$grub" "$grub_work/grub.cfg"
+    grub_apply_firmware_policy "$firmware_policy" "$grub_work/grub.cfg" "$grub_work/no-firmware.cfg"
+    grub-script-check "$grub_work/grub.cfg"
 else
     grub-script-check "$grub"
-    printf '%s\n' 'Existing GRUB menu already has quiet splash; leaving grub.cfg unchanged.'
+    printf '%s\n' 'Existing GRUB menu already has quiet splash and matches the firmware policy; leaving grub.cfg unchanged.'
 fi
 
 install -d -m 0755 -- "$theme"
