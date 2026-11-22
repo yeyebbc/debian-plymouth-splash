@@ -6,31 +6,44 @@ export PATH
 
 usage() {
     cat <<'EOF'
-Usage: sudo sh debian-plymouth-splash.sh
+Usage: sudo sh debian-plymouth-splash.sh [--no-grub]
 
 Installs a white Debian swirl on black for boot, power-off, and reboot.
-Requires Debian with GRUB, systemd, initramfs-tools, Plymouth's script
-and label plugins, desktop-base, and ImageMagick. Re-running is safe.
-GRUB remains visible; existing Windows entries must survive regeneration.
-For this installation, GRUB_DISABLE_UEFI_FIRMWARE=true hides the stock
-firmware entry, false permits it, and unset preserves its visibility.
-A disabled generator stays disabled. Custom entries are left alone.
+Requires Debian with systemd, plymouth, plymouth-label, desktop-base, and
+ImageMagick with SVG support (librsvg2-bin supplies the SVG renderer).
+Rebuilds and verifies existing /boot/initrd.img-* images using
+initramfs-tools. Re-running is safe.
+
+Updates GRUB if /boot/grub/grub.cfg exists. Use --no-grub to skip GRUB
+even if its configuration is present. GRUB remains visible; existing
+Windows entries must survive regeneration. GRUB_DISABLE_UEFI_FIRMWARE=true
+hides the stock firmware entry, false permits it, and unset preserves its
+visibility. A disabled generator stays disabled; custom entries are left alone.
+
+For other bootloaders, add quiet splash to the Debian kernel command line
+without removing other arguments. If the boot image embeds a Debian
+initramfs (e.g. Android boot.img), rebuild it with the updated initramfs.
+If there is no local initramfs, Plymouth can start when systemd takes over.
+For an earlier splash, include and start Plymouth in your existing ramdisk.
 EOF
 }
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
-case ${1-} in
-    -h|--help) usage; exit 0 ;;
-    '') [ "$#" -eq 0 ] || { usage >&2; exit 2; } ;;
+require_commands() {
+    for tool do
+        command -v "$tool" >/dev/null || fail "Missing required command: $tool"
+    done
+}
+
+manage_grub=auto
+case $#:${1-} in
+    1:-h|1:--help) usage; exit 0 ;;
+    1:--no-grub) manage_grub=no ;;
+    0:) ;;
     *) usage >&2; exit 2 ;;
 esac
 [ "$(id -u)" -eq 0 ] || fail 'Run this installer with sudo.'
-script_path=$(realpath -- "$0")
-script_dir=${script_path%/*}
-. "$script_dir/grub-firmware.sh"
-for tool in plymouth-set-default-theme grub-mkconfig grub-script-check update-initramfs unmkinitramfs systemctl systemd-analyze; do
-    command -v "$tool" >/dev/null || fail "Missing required command: $tool"
-done
+require_commands plymouth plymouth-set-default-theme systemctl systemd-analyze
 if command -v magick >/dev/null; then imagemagick=magick
 elif command -v convert >/dev/null; then imagemagick=convert
 else fail 'Install imagemagick first.'
@@ -42,12 +55,31 @@ logo=/usr/share/desktop-base/debian-logos/logo.svg
 grub=/boot/grub/grub.cfg
 dropin=/etc/default/grub.d/99-debian-monochrome-splash.cfg
 [ -r "$logo" ] || fail 'Install desktop-base for the official Debian swirl.'
-[ -f "$grub" ] && [ ! -L "$grub" ] || fail "Expected a regular GRUB configuration: $grub"
-[ ! -L "$theme" ] && [ ! -L "$dropin" ] && { [ ! -e "$dropin" ] || [ -f "$dropin" ]; } ||
-    fail 'Unexpected Plymouth theme or GRUB defaults path.'
-firmware_policy=$(grub_firmware_policy /etc/default/grub "$grub" /etc/grub.d/30_uefi-firmware)
-set -- /boot/initrd.img-*
-[ -f "$1" ] || fail 'No installed initramfs images under /boot.'
+[ ! -L "$theme" ] || fail "Unexpected Plymouth theme path: $theme"
+
+if [ "$manage_grub" = auto ] && { [ -e "$grub" ] || [ -L "$grub" ]; }; then
+    manage_grub=yes
+    [ -f "$grub" ] && [ ! -L "$grub" ] || fail "Expected a regular GRUB configuration: $grub"
+    [ ! -L "$dropin" ] && { [ ! -e "$dropin" ] || [ -f "$dropin" ]; } ||
+        fail "Unexpected GRUB defaults path: $dropin"
+    require_commands grub-mkconfig grub-script-check
+    script_path=$(realpath -- "$0")
+    script_dir=${script_path%/*}
+    . "$script_dir/grub-firmware.sh"
+    firmware_policy=$(grub_firmware_policy /etc/default/grub "$grub" /etc/grub.d/30_uefi-firmware)
+else
+    manage_grub=no
+fi
+
+set --
+for image in /boot/initrd.img-*; do
+    if [ -f "$image" ]; then set -- "$@" "$image"; fi
+done
+if [ "$#" -gt 0 ]; then
+    require_commands update-initramfs unmkinitramfs
+elif [ "$manage_grub" = yes ]; then
+    fail 'No installed initramfs images under /boot.'
+fi
 plugin_dir=$(plymouth --get-splash-plugin-path)
 [ -r "${plugin_dir%/}/script.so" ] && [ -r "${plugin_dir%/}/label-pango.so" ] ||
     fail 'Install plymouth and plymouth-label first.'
@@ -215,19 +247,6 @@ Plymouth.SetDisplayQuestionFunction(show_question);
 Plymouth.SetDisplayNormalFunction(show_normal);
 PLYMOUTH
 
-cat > "$work/grub-defaults" <<'GRUB'
-# Show Plymouth after selecting Debian, not in the GRUB menu.
-for plymouth_flag in quiet splash; do
-    case " ${GRUB_CMDLINE_LINUX_DEFAULT:-} " in
-        *" $plymouth_flag "*) ;;
-        *) GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+${GRUB_CMDLINE_LINUX_DEFAULT} }$plymouth_flag" ;;
-    esac
-done
-unset plymouth_flag
-GRUB_TIMEOUT_STYLE=menu
-case ${GRUB_TIMEOUT:-0} in 0) GRUB_TIMEOUT=5 ;; esac
-GRUB
-
 check_grub() {
     awk '
         $1 == "set" && $2 ~ /^timeout_style=/ { menu = ($2 == "timeout_style=menu") }
@@ -248,33 +267,47 @@ windows_entries() {
     }' "$1"
 }
 
-if [ ! -e "$dropin" ]; then
-    restore_grub=yes
-    install -D -m 0644 -- "$work/grub-defaults" "$dropin"
-fi
-if ! check_grub "$grub" ||
-    { [ "$firmware_policy" = enable ] && ! grub_has_firmware_entry "$grub"; }; then
-    grub_work=$(mktemp -d /boot/grub/.debian-monochrome.XXXXXXXX)
-    grub-mkconfig -o "$grub_work/grub.cfg"
-    grub_apply_firmware_policy "$firmware_policy" "$grub_work/grub.cfg" "$grub_work/no-firmware.cfg"
-    grub-script-check "$grub_work/grub.cfg"
-    check_grub "$grub_work/grub.cfg" || fail 'The generated GRUB configuration does not keep a visible menu and quiet splash.'
-    if [ "$firmware_policy" = allow ] && ! grub_has_firmware_entry "$grub_work/grub.cfg"; then
-        fail 'The generated menu lost the firmware entry; leaving the current GRUB menu intact.'
+if [ "$manage_grub" = yes ]; then
+    if [ ! -e "$dropin" ]; then
+        cat > "$work/grub-defaults" <<'GRUB'
+# Show Plymouth after selecting Debian, not in the GRUB menu.
+for plymouth_flag in quiet splash; do
+    case " ${GRUB_CMDLINE_LINUX_DEFAULT:-} " in
+        *" $plymouth_flag "*) ;;
+        *) GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+${GRUB_CMDLINE_LINUX_DEFAULT} }$plymouth_flag" ;;
+    esac
+done
+unset plymouth_flag
+GRUB_TIMEOUT_STYLE=menu
+case ${GRUB_TIMEOUT:-0} in 0) GRUB_TIMEOUT=5 ;; esac
+GRUB
+        restore_grub=yes
+        install -D -m 0644 -- "$work/grub-defaults" "$dropin"
     fi
-    windows_entries "$grub" > "$work/windows.old"
-    windows_entries "$grub_work/grub.cfg" > "$work/windows.new"
-    if grep -Fxvf "$work/windows.new" "$work/windows.old"; then
-        fail 'An existing Windows entry is missing; leaving the current GRUB menu intact.'
+    if ! check_grub "$grub" ||
+        { [ "$firmware_policy" = enable ] && ! grub_has_firmware_entry "$grub"; }; then
+        grub_work=$(mktemp -d /boot/grub/.debian-monochrome.XXXXXXXX)
+        grub-mkconfig -o "$grub_work/grub.cfg"
+        grub_apply_firmware_policy "$firmware_policy" "$grub_work/grub.cfg" "$grub_work/no-firmware.cfg"
+        grub-script-check "$grub_work/grub.cfg"
+        check_grub "$grub_work/grub.cfg" || fail 'The generated GRUB configuration does not keep a visible menu and quiet splash.'
+        if [ "$firmware_policy" = allow ] && ! grub_has_firmware_entry "$grub_work/grub.cfg"; then
+            fail 'The generated menu lost the firmware entry; leaving the current GRUB menu intact.'
+        fi
+        windows_entries "$grub" > "$work/windows.old"
+        windows_entries "$grub_work/grub.cfg" > "$work/windows.new"
+        if grep -Fxvf "$work/windows.new" "$work/windows.old"; then
+            fail 'An existing Windows entry is missing; leaving the current GRUB menu intact.'
+        fi
+    elif [ "$firmware_policy" = hide ] && grub_has_firmware_entry "$grub"; then
+        grub_work=$(mktemp -d /boot/grub/.debian-monochrome.XXXXXXXX)
+        cp -p -- "$grub" "$grub_work/grub.cfg"
+        grub_apply_firmware_policy "$firmware_policy" "$grub_work/grub.cfg" "$grub_work/no-firmware.cfg"
+        grub-script-check "$grub_work/grub.cfg"
+    else
+        grub-script-check "$grub"
+        printf '%s\n' 'Existing GRUB menu already has quiet splash and matches the firmware policy; leaving grub.cfg unchanged.'
     fi
-elif [ "$firmware_policy" = hide ] && grub_has_firmware_entry "$grub"; then
-    grub_work=$(mktemp -d /boot/grub/.debian-monochrome.XXXXXXXX)
-    cp -p -- "$grub" "$grub_work/grub.cfg"
-    grub_apply_firmware_policy "$firmware_policy" "$grub_work/grub.cfg" "$grub_work/no-firmware.cfg"
-    grub-script-check "$grub_work/grub.cfg"
-else
-    grub-script-check "$grub"
-    printf '%s\n' 'Existing GRUB menu already has quiet splash and matches the firmware policy; leaving grub.cfg unchanged.'
 fi
 
 install -d -m 0755 -- "$theme"
@@ -301,20 +334,32 @@ done
 systemd-analyze verify --recursive-errors=no poweroff.target reboot.target plymouth-poweroff.service plymouth-reboot.service
 systemctl daemon-reload
 
-update-initramfs -u -k all
-for image do
-    unmkinitramfs "$image" "$work/initrd"
-    embedded=$(find "$work/initrd" -type f -path "*/${theme#/}/$name.plymouth" -print)
-    [ -f "$embedded" ] || fail "No unique $name theme in $image."
-    for file in "$work/$name.plymouth" "$work/$name.script" "$work"/swirl-*.png; do
-        cmp -- "$file" "${embedded%/*}/${file##*/}"
+if [ "$#" -gt 0 ]; then
+    update-initramfs -u -k all
+    for image do
+        unmkinitramfs "$image" "$work/initrd"
+        embedded=$(find "$work/initrd" -type f -path "*/${theme#/}/$name.plymouth" -print)
+        [ -f "$embedded" ] || fail "No unique $name theme in $image."
+        for file in "$work/$name.plymouth" "$work/$name.script" "$work"/swirl-*.png; do
+            cmp -- "$file" "${embedded%/*}/${file##*/}"
+        done
+        conf=$(find "$work/initrd" -type f -path '*/etc/plymouth/plymouthd.conf' -print)
+        grep -Fxq "Theme=$name" "$conf" || fail "The theme is not selected in $image."
+        printf 'Verified theme in %s\n' "$image"
+        rm -rf -- "$work/initrd"
     done
-    conf=$(find "$work/initrd" -type f -path '*/etc/plymouth/plymouthd.conf' -print)
-    grep -Fxq "Theme=$name" "$conf" || fail "The theme is not selected in $image."
-    printf 'Verified theme in %s\n' "$image"
-    rm -rf -- "$work/initrd"
-done
+fi
 
 if [ -n "$grub_work" ]; then mv -fT -- "$grub_work/grub.cfg" "$grub"; fi
 restore_grub=no
-printf '%s\n' 'Installed responsive Plymouth splash for boot, power-off, and reboot.'
+printf '%s\n' 'Installed responsive Plymouth theme and power-off/reboot configuration.'
+if [ "$manage_grub" = no ]; then
+    printf '%s\n' 'GRUB was not changed. Add quiet splash to your Debian kernel command line.'
+    if [ "$#" -eq 0 ]; then
+        printf '%s\n' \
+            'No /boot/initrd.img-* images found; no initramfs was rebuilt.' \
+            'Plymouth can start when systemd takes over. For an earlier splash, include and start Plymouth in your boot ramdisk.'
+    else
+        printf '%s\n' 'If your boot image embeds the initramfs (e.g. Android boot.img), rebuild it with the updated initramfs.'
+    fi
+fi
